@@ -54,35 +54,52 @@ func CloseSocket() error {
 
 // Read returns the IPC socket response as a string
 // simply slice the backing array.
-func Read() string {
-	buf := make([]byte, 512)
-	n, err := socket.Read(buf)
-	if err != nil {
-		fmt.Println("Nothing to read:", err)
-		// return an empty string if nothing is read.
-		return ""
-	}
+func Read() (string, error) {
+    // read exactly 8-byte header
+    hdr := make([]byte, 8)
+    n := 0
+    for n < 8 {
+        nn, err := socket.Read(hdr[n:])
+        if err != nil {
+            return "", fmt.Errorf("read header error: %w", err)
+        }
+        n += nn
+    }
+    // opcode := binary.LittleEndian.Uint32(hdr[0:4])
+    length := binary.LittleEndian.Uint32(hdr[4:8])
 
-	if n <= 8 {
-		return ""
-	}
+    if length == 0 {
+        return "", nil
+    }
 
-	return string(buf[8:n])
+    buf := make([]byte, length)
+    got := 0
+    for uint32(got) < length {
+        nn, err := socket.Read(buf[got:])
+        if err != nil {
+            return "", fmt.Errorf("read payload error: %w", err)
+        }
+        got += nn
+    }
+
+    // optional: debug log
+    // fmt.Printf("Read opcode=%d length=%d\n", opcode, length)
+    return string(buf), nil
 }
 
-// Send builds the message and writes it to the socket
-func Send(opcode int, payload string) string {
-	// create a fixed-size header buffer to avoid multiple allocations
-	hdr := make([]byte, 8)
-	binary.LittleEndian.PutUint32(hdr[0:4], uint32(opcode))
-	binary.LittleEndian.PutUint32(hdr[4:8], uint32(len(payload)))
+func Send(opcode int, payload string) (string, error) {
+    hdr := make([]byte, 8)
+    binary.LittleEndian.PutUint32(hdr[0:4], uint32(opcode))
+    binary.LittleEndian.PutUint32(hdr[4:8], uint32(len(payload)))
 
-	// concatenate header and payload.
-	msg := append(hdr, payload...)
-	_, err := socket.Write(msg)
-	if err != nil {
-		fmt.Println("Error writing to socket:", err)
-	}
+    msg := append(hdr, []byte(payload)...)
+    if _, err := socket.Write(msg); err != nil {
+        return "", fmt.Errorf("write error: %w", err)
+    }
 
-	return Read()
+    resp, err := Read()
+    if err != nil {
+        return "", err
+    }
+    return resp, nil
 }

@@ -13,20 +13,23 @@ var logged bool
 
 // login sends a handshake via IPC.
 func Login(clientid string) error {
-	if !logged {
-		payload, err := json.Marshal(Handshake{"1", clientid})
-		if err != nil {
-			return err
-		}
-
-		if err = ipc.OpenSocket(); err != nil {
-			return err
-		}
-
-		ipc.Send(0, string(payload))
-	}
-	logged = true
-	return nil
+    if !logged {
+        payload, err := json.Marshal(Handshake{V: 1, ClientId: clientid})
+        if err != nil {
+            return err
+        }
+        if err = ipc.OpenSocket(); err != nil {
+            return err
+        }
+        resp, err := ipc.Send(0, string(payload))
+        if err != nil {
+            return fmt.Errorf("handshake send/read failed: %w (resp=%q)", err, resp)
+        }
+        fmt.Println("handshake response:", resp)
+        // DO NOT send handshake again
+    }
+    logged = true
+    return nil
 }
 
 func Logout() {
@@ -38,24 +41,43 @@ func Logout() {
 
 // SetActivity sends an activity update.
 func SetActivity(activity Activity) error {
-	if !logged {
-		return nil
-	}
+    if !logged {
+        return nil
+    }
 
-	payload, err := json.Marshal(Frame{
-		Cmd: "SET_ACTIVITY",
-		Args: Args{
-			Pid:      os.Getpid(),
-			Activity: mapActivity(&activity),
-		},
-		Nonce: getNonce(),
-	})
-	if err != nil {
-		return err
-	}
+    payload, err := json.Marshal(Frame{
+        Cmd: "SET_ACTIVITY",
+        Args: Args{
+            Pid:      os.Getpid(),
+            Activity: mapActivity(&activity),
+        },
+        Nonce: getNonce(),
+    })
+    if err != nil {
+        return err
+    }
 
-	ipc.Send(1, string(payload))
-	return nil
+    fmt.Println("SET_ACTIVITY payload:", string(payload))
+
+    // First try
+    resp, err := ipc.Send(1, string(payload))
+    if err != nil {
+        fmt.Println("SET_ACTIVITY first send failed:", err, "resp:", resp)
+        // If broken pipe or connection dropped, try to reopen once
+        if err := ipc.CloseSocket(); err == nil {
+            if openErr := ipc.OpenSocket(); openErr == nil {
+                fmt.Println("reopened socket, retrying SET_ACTIVITY")
+                resp, err = ipc.Send(1, string(payload))
+            } else {
+                fmt.Println("failed to reopen socket:", openErr)
+            }
+        }
+    }
+    if err != nil {
+        return fmt.Errorf("SET_ACTIVITY failed: %w (resp=%q)", err, resp)
+    }
+    fmt.Println("SET_ACTIVITY response:", resp)
+    return nil
 }
 
 // getNonce creates a nonce string.

@@ -1,8 +1,8 @@
 package client
 
 type Handshake struct {
-	V        string `json:"v"`
-	ClientId string `json:"client_id"`
+    V        int    `json:"v"`
+    ClientId string `json:"client_id"`
 }
 
 type Frame struct {
