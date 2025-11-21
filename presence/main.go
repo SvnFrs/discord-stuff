@@ -4,15 +4,34 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os/exec"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/shirou/gopsutil/cpu"
+	"github.com/shirou/gopsutil/mem"
+	psnet "github.com/shirou/gopsutil/net"
+
 	"example.com/presence/lib/client"
 )
 
-// RunFastfetch runs `fastfetch -l none` with timeout and returns stdout/stderr as string.
+// Configuration
+const (
+	clientID           = ""
+	pollInterval       = 10 * time.Second
+	cpuThresholdPct    = 2.0
+	memThresholdPct    = 2.0
+	netThresholdBytes  = 10 * 1024
+	detailsMaxRunes    = 128
+	pasteUploadTimeout = 5 * time.Second
+	reconnectAttempts  = 3
+	reconnectBackoff   = 1 * time.Second
+)
+
+// RunFastfetch runs fastfetch -l none and returns its output (may be partial on error)
 func RunFastfetch(ctx context.Context) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -21,107 +40,76 @@ func RunFastfetch(ctx context.Context) (string, error) {
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
-		// If fastfetch is missing or times out, return partial output + error
 		return out.String(), err
 	}
 	return out.String(), nil
 }
 
-// ParseFastfetch parses the output into a map of keys and returns a client.Activity built from them.
-func ParseFastfetch(output string) (client.Activity, error) {
+// ParseFastfetch parses fastfetch output into a map and returns:
+//  - the parsed map
+//  - a concise staticDetails string containing only the requested fields
+//  - a short staticState (user@host or empty)
+func ParseFastfetch(output string) (map[string]string, string, string) {
 	lines := strings.Split(output, "\n")
 	m := map[string]string{}
-
-	// capture first non-empty line (user@host) as "UserHost"
-	for _, l := range lines {
-		l = strings.TrimSpace(l)
-		if l == "" || strings.HasPrefix(l, "---") {
-			continue
-		}
-		if strings.Contains(l, "@") && strings.Contains(l, " ") == false {
-			m["UserHost"] = l
-			break
-		}
-	}
 
 	for _, raw := range lines {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "---") {
 			continue
 		}
-		// Key: Value pairs
+		// capture user@host first non-empty line
+		if _, ok := m["UserHost"]; !ok {
+			if strings.Contains(line, "@") && !strings.Contains(line, " ") {
+				m["UserHost"] = line
+				continue
+			}
+		}
 		if idx := strings.Index(line, ":"); idx != -1 {
 			key := strings.TrimSpace(line[:idx])
 			val := strings.TrimSpace(line[idx+1:])
-			if key != "" {
+			if key != "" && val != "" {
 				m[key] = val
 			}
 		}
 	}
 
-	// Build a compact summary for "Details" (multiline) and "State" (one-liner).
-	// Choose which keys are interesting and their order:
-	order := []string{"OS", "Kernel", "Uptime", "Packages", "Shell", "DE", "WM", "CPU", "GPU", "Memory", "Disk (/)", "Locale"}
-	var detailsParts []string
-	for _, k := range order {
-		if v, ok := m[k]; ok && v != "" {
-			detailsParts = append(detailsParts, fmt.Sprintf("%s: %s", k, v))
-		}
-	}
-	details := strings.Join(detailsParts, "\n")
+	// Build static details with only the requested keys:
+	// OS, Kernel, Packages, CPU (model), Memory (used/total (pct))
+	osVal := m["OS"]
+	kernelVal := m["Kernel"]
+	pkgsVal := m["Packages"]
+	cpuVal := m["CPU"]
+	memVal := m["Memory"]
 
-	// state short: user@host + display/res if present
-	stateParts := []string{}
+	// Construct multi-line details (each field on its own line)
+	parts := []string{}
+	if osVal != "" {
+		parts = append(parts, fmt.Sprintf("OS: %s", osVal))
+	}
+	if kernelVal != "" {
+		parts = append(parts, fmt.Sprintf("Kernel: %s", kernelVal))
+	}
+	if pkgsVal != "" {
+		parts = append(parts, fmt.Sprintf("Packages: %s", pkgsVal))
+	}
+	if cpuVal != "" {
+		parts = append(parts, fmt.Sprintf("CPU: %s", cpuVal))
+	}
+	if memVal != "" {
+		parts = append(parts, fmt.Sprintf("Memory: %s", memVal))
+	}
+	staticDetails := strings.Join(parts, "\n")
+	staticDetails = truncateRunes(staticDetails, detailsMaxRunes)
+
+	staticState := ""
 	if uh, ok := m["UserHost"]; ok {
-		stateParts = append(stateParts, uh)
-	}
-	if disp, ok := m["Display"]; ok {
-		// Display line often contains resolution and model in fastfetch
-		stateParts = append(stateParts, disp)
-	}
-	state := strings.Join(stateParts, " • ")
-
-	btns := []*client.Button{}
-	pasteURL := uploadToPasteService(details + "\n\n" + state)
-	if pasteURL != "" {
-		btns = append(btns, &client.Button{
-			Label: "Full fastfetch output",
-			Url:   pasteURL,
-		})
+		staticState = uh
 	}
 
-	// map some keys to assets (you must upload images to your Discord app and use these keys)
-	largeImageKey := pickImageKey(m) // helper below
-	largeText := m["DE"]
-	if largeText == "" {
-		largeText = m["WM"]
-	}
-	smallImageKey := "dot" // fallback; upload a generic asset named "dot" or change accordingly
-	smallText := m["Kernel"]
-
-	// ensure we don't exceed Discord field length limits (use conservative 128)
-	details = truncateRunes(details, 128)
-	state = truncateRunes(state, 128)
-	largeText = truncateRunes(largeText, 128)
-	smallText = truncateRunes(smallText, 128)
-
-	activity := client.Activity{
-		Details:    details,
-		State:      state,
-		LargeImage: largeImageKey,
-		LargeText:  largeText,
-		SmallImage: smallImageKey,
-		SmallText:  smallText,
-		Timestamps: &client.Timestamps{Start: ptrTime(time.Now())},
-		Buttons:    btns,
-	}
-
-	return activity, nil
+	return m, staticDetails, staticState
 }
 
-func ptrTime(t time.Time) *time.Time { return &t }
-
-// truncateRunes truncates a string to at most n runes and appends ellipsis if trimmed.
 func truncateRunes(s string, n int) string {
 	if n <= 0 {
 		return ""
@@ -136,20 +124,54 @@ func truncateRunes(s string, n int) string {
 	return string(r[:n])
 }
 
-// pickImageKey maps fastfetch fields to your uploaded asset keys.
-// Edit this to match the asset keys you uploaded to the Discord app.
+// uploadToPasteService uploads text to paste.rs and returns the resulting URL or empty string on failure.
+func uploadToPasteService(text string) string {
+	clientHTTP := &http.Client{Timeout: pasteUploadTimeout}
+	resp, err := clientHTTP.Post("https://paste.rs", "text/plain; charset=utf-8", strings.NewReader(text))
+	if err != nil {
+		fmt.Println("paste upload failed:", err)
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		fmt.Println("paste upload unexpected status:", resp.Status)
+		return ""
+	}
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Println("paste read failed:", err)
+		return ""
+	}
+	url := strings.TrimSpace(string(b))
+	if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+		return url
+	}
+	return ""
+}
+
+func humanBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func ptrTime(t time.Time) *time.Time { return &t }
+
 func pickImageKey(m map[string]string) string {
-	// example rules (customize)
 	if os, ok := m["OS"]; ok {
 		os = strings.ToLower(os)
 		if strings.Contains(os, "arch") {
-			return "arch" // asset key "arch"
+			return "arch"
 		}
 		if strings.Contains(os, "ubuntu") {
 			return "ubuntu"
-		}
-		if strings.Contains(os, "fedora") {
-			return "fedora"
 		}
 	}
 	if gpu, ok := m["GPU"]; ok {
@@ -160,40 +182,169 @@ func pickImageKey(m map[string]string) string {
 		if strings.Contains(gpu, "nvidia") {
 			return "nvidia"
 		}
-		if strings.Contains(gpu, "intel") {
-			return "intel"
-		}
 	}
 	return "default_os"
 }
 
-// uploadToPasteService is a stub. You can implement uploading to a pastebin/Hastebin service and return the URL.
-// For now, just return an empty string (Discord buttons require a valid URL, so implement if you want buttons).
-func uploadToPasteService(text string) string {
-	// implement network upload & return URL
-	// return "" to omit button
-	return ""
+// monitorLoop polls CPU/memory/network and updates Discord presence using client.SetActivity.
+// It keeps staticDetails (only OS/Kernel/Packages/CPU/Memory) in Details and
+// uses State/SmallText for dynamic stats.
+func monitorLoop(ctx context.Context, static map[string]string, staticDetails, staticState string) {
+	largeImageKey := pickImageKey(static)
+	largeText := static["DE"]
+	if largeText == "" {
+		largeText = static["WM"]
+	}
+	smallImageKey := "dot"
+
+	// upload paste for full fastfetch output (optional)
+	pasteURL := ""
+	fullText := staticDetails
+	if d, ok := static["UserHost"]; ok {
+		fullText = d + "\n" + fullText
+	}
+	pasteURL = uploadToPasteService(fullText)
+
+	// initial handshake/login
+	if err := client.Login(clientID); err != nil {
+		fmt.Println("initial Login failed:", err)
+		for i := 0; i < reconnectAttempts; i++ {
+			time.Sleep(reconnectBackoff)
+			if err := client.Login(clientID); err == nil {
+				break
+			} else if i == reconnectAttempts-1 {
+				fmt.Println("could not login after retries:", err)
+				return
+			}
+		}
+	}
+	fmt.Println("Logged in")
+
+	_, _ = cpu.Percent(0, false)
+	prevNet, _ := psnet.IOCounters(false)
+	prevTime := time.Now()
+
+	var lastState string
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			client.Logout()
+			return
+		case <-ticker.C:
+			// CPU percent (overall)
+			cpuPctSlice, err := cpu.Percent(0, false)
+			if err != nil || len(cpuPctSlice) == 0 {
+				fmt.Println("cpu read failed:", err)
+				continue
+			}
+			cpuPct := cpuPctSlice[0]
+
+			// Memory
+			vm, err := mem.VirtualMemory()
+			if err != nil {
+				fmt.Println("mem read failed:", err)
+				continue
+			}
+			memPct := vm.UsedPercent
+
+			// Network throughput
+			curNet, _ := psnet.IOCounters(false)
+			now := time.Now()
+			interval := now.Sub(prevTime).Seconds()
+			var rxPerSec, txPerSec float64
+			if len(prevNet) > 0 && len(curNet) > 0 && interval > 0 {
+				rxPerSec = float64(curNet[0].BytesRecv-prevNet[0].BytesRecv) / interval
+				txPerSec = float64(curNet[0].BytesSent-prevNet[0].BytesSent) / interval
+			}
+			prevNet = curNet
+			prevTime = now
+
+			// Build dynamic strings
+			state := fmt.Sprintf("CPU %.0f%% • RAM %.0f%%", cpuPct, memPct)
+			// Put network into Details? user asked to leave rest to stats; we keep Details static only.
+			smallTextNow := fmt.Sprintf("%.0f%% RAM", memPct)
+
+			// thresholding
+			shouldUpdate := false
+			if lastState == "" {
+				shouldUpdate = true
+			} else {
+				var lastCpuPct, lastMemPct float64
+				fmt.Sscanf(lastState, "CPU %f%% • RAM %f%%", &lastCpuPct, &lastMemPct)
+				if absFloat(cpuPct-lastCpuPct) >= cpuThresholdPct || absFloat(memPct-lastMemPct) >= memThresholdPct {
+					shouldUpdate = true
+				} else if (rxPerSec+txPerSec) >= float64(netThresholdBytes) {
+					shouldUpdate = true
+				}
+			}
+
+			if !shouldUpdate {
+				continue
+			}
+
+			// Build activity with only the concise staticDetails in Details
+			act := client.Activity{
+				Details:    staticDetails,
+				State:      state,
+				LargeImage: largeImageKey,
+				LargeText:  largeText,
+				SmallImage: smallImageKey,
+				SmallText:  smallTextNow,
+				Timestamps: &client.Timestamps{Start: ptrTime(time.Now())},
+			}
+			if pasteURL != "" {
+				act.Buttons = []*client.Button{
+					{Label: "Full fastfetch output", Url: pasteURL},
+				}
+			}
+
+			if err := client.SetActivity(act); err != nil {
+				fmt.Println("SetActivity failed:", err)
+				// reconnect and retry once
+				client.Logout()
+				var loginErr error
+				for i := 0; i < reconnectAttempts; i++ {
+					loginErr = client.Login(clientID)
+					if loginErr == nil {
+						break
+					}
+					time.Sleep(reconnectBackoff * time.Duration(i+1))
+				}
+				if loginErr == nil {
+					if retryErr := client.SetActivity(act); retryErr != nil {
+						fmt.Println("SetActivity retry failed:", retryErr)
+					} else {
+						lastState = act.State
+					}
+				} else {
+					fmt.Println("reconnect attempts failed:", loginErr)
+				}
+			} else {
+				lastState = act.State
+			}
+		}
+	}
+}
+
+func absFloat(a float64) float64 {
+	if a < 0 {
+		return -a
+	}
+	return a
 }
 
 func main() {
-	// Example usage
-	out, err := RunFastfetch(context.Background())
-	if err != nil && out == "" {
-		fmt.Println("fastfetch failed:", err)
-		// continue with defaults or return
-	}
+	out, _ := RunFastfetch(context.Background())
+	staticMap, staticDetails, staticState := ParseFastfetch(out)
 
-	act, err := ParseFastfetch(out)
-	if err != nil {
-		fmt.Println("parse failed:", err)
-		return
-	}
+	// print static details to stdout (optional)
+	fmt.Println("Static details to be used in presence:")
+	fmt.Println(staticDetails)
 
-	if err := client.Login(""); err != nil {
-		panic(err)
-	}
-	if err := client.SetActivity(act); err != nil {
-		fmt.Println("set activity failed:", err)
-	}
-	select {} // keep running to show presence
+	ctx := context.Background()
+	monitorLoop(ctx, staticMap, staticDetails, staticState)
 }
